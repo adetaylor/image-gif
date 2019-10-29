@@ -310,18 +310,18 @@ impl<R> Reader<R> where R: Read {
         loop {
             match self.decoder.decode_next()? {
                 Some(Decoded::Data(data)) => {
+                    //println!("Got data len {:?}, {:?}", data.len(), &data);
                     let (len, channels) = handle_data!(data);
                     let buf_ = buf; buf = &mut buf_[len*channels..]; // shorten buf
                     if buf.len() > 0 {
                         continue
                     } else if len < data.len() {
-                        self.buffer.extend(data[len..].iter().map(|&v| v));
+                        self.buffer.extend(&data[len..]);
                     }
                     return Ok(true)
                 },
                 Some(_) => return Ok(false), // make sure that no important result is missed
                 None => return Ok(false)
-                
             }
         }
     }

@@ -7,13 +7,144 @@ use std::io;
 use std::fmt;
 use std::error;
 
-use lzw;
-
 use traits::Parameter;
 use common::{Frame, Block, Extension, DisposalMethod};
 
 /// GIF palettes are RGB
 pub const PLTE_CHANNELS: usize = 3;
+
+
+
+/// ADE LZW
+///
+///
+
+/* ----------- LZW stuff -------------- */
+
+
+#[derive(Copy)]
+#[derive(Clone)]
+#[derive(Debug)]
+struct LzwDictEntry {
+    prev: usize,
+    back: usize,
+    c: u8,
+}
+
+#[derive(Debug)]
+struct SimpleLzwDecoder {
+    orig_code_size: u32,
+    code_size: u32,
+    d: Vec<LzwDictEntry>,
+    next_shift: usize,
+    acc: u32,
+    n_bits: u32,
+    out_buf: Vec<u8>,
+    clr_code: usize,
+    end_code: usize,
+    raw_char_limit: usize,
+}
+
+impl SimpleLzwDecoder {
+
+    // This code is based on wisdom from
+    // https://rosettacode.org/wiki/LZW_compression#C
+    // and may be under the GNU Free Documentation License.
+
+    fn new(code_size: u8) -> SimpleLzwDecoder {
+        //println!("Code size {:?}", code_size);
+        let mut me = SimpleLzwDecoder{
+            orig_code_size: code_size as u32 + 1,
+            code_size: code_size as u32 + 1,
+            d: Vec::with_capacity(512),
+            next_shift: 512usize,
+            acc: 0u32,
+            n_bits: 0u32,
+            out_buf: Vec::with_capacity(512),
+            clr_code: (1 << code_size),
+            end_code: (1 << code_size)+1,
+            raw_char_limit: ((1usize << (code_size))-1),
+        };
+        me.clear_dict();
+        me
+    }
+
+    fn clear_dict(&mut self) {
+        self.d.clear();
+        self.code_size = self.orig_code_size;
+        for j in 0usize..(1usize << (self.code_size-1)) {
+            self.d.push(LzwDictEntry{prev:0usize, back:0usize, c: j as u8});
+        }
+        self.d.push(LzwDictEntry{prev:0usize, back:0usize, c: 0u8});
+        self.d.push(LzwDictEntry{prev:0usize, back:0usize, c: 0u8});
+        self.next_shift = (1 << self.code_size as usize);
+    }
+
+    fn decode_bytes(&mut self, input: &[u8]) -> (usize, &[u8]) {
+        let mut inp = input;
+        self.out_buf.clear();
+
+        loop {
+            // Get a code
+            while(self.n_bits < self.code_size && inp.len() > 0) {
+                if inp.len() > 0 {
+                    let this_byte = inp[0] as u32;
+                    inp = &inp[1..];
+                    self.acc |= this_byte << self.n_bits;
+                    self.n_bits += 8;
+                } else {
+                    self.acc = self.acc << (self.code_size - self.n_bits);
+                    self.n_bits = self.code_size;
+                }
+            }
+            if self.n_bits < self.code_size {
+                // Not yet enough bits to decode a whole code
+                return (input.len() - inp.len(), &self.out_buf);
+            }
+            // We have a code! Let's decode it.
+            let code = (self.acc as usize) & ((1usize << self.code_size) - 1usize);
+            self.acc >>= self.code_size;
+            self.n_bits -= self.code_size;
+            // end get_code()
+            if code == self.end_code {
+                break;
+            }
+            if code == self.clr_code {
+                self.clear_dict();
+                continue;
+            }
+
+            let mut c = code;
+            //assert!(code < self.d.len()+1);
+            let new_code = self.d.len();
+            self.d.push(LzwDictEntry{prev:code, back:0usize, c: 0u8});
+            while c > self.raw_char_limit {
+                let t = self.d[c].prev;
+                self.d[t].back = c;
+                c = t;
+            }
+
+            self.d[new_code - 1].c = c as u8;
+
+            while self.d[c].back != 0 {
+                self.out_buf.push(self.d[c].c);
+                let t = self.d[c].back;
+                self.d[c].back = 0;
+                c = t;
+            }
+            self.out_buf.push(self.d[c].c);
+
+            if new_code == self.next_shift && new_code < 4096 {
+                self.code_size += 1;
+                assert!(self.code_size <= 16);
+                self.next_shift *= 2;
+            }
+        }
+        (input.len() - inp.len(), &self.out_buf)
+    }
+}
+
+/// END ADE LZW
 
 #[derive(Debug)]
 /// Decoding error.
@@ -162,7 +293,7 @@ enum ByteValue {
 #[derive(Debug)]
 pub struct StreamingDecoder {
     state: Option<State>,
-    lzw_reader: Option<lzw::Decoder<lzw::LsbReader>>,
+    lzw_reader: Option<SimpleLzwDecoder>,
     skip_extensions: bool,
     version: &'static str,
     width: u16,
@@ -506,14 +637,14 @@ impl StreamingDecoder {
                         "invalid minimal code size"
                     ))
                 }
-                self.lzw_reader = Some(lzw::Decoder::new(lzw::LsbReader::new(), code_size));
+                self.lzw_reader = Some(SimpleLzwDecoder::new(code_size));
                 goto!(DecodeSubBlock(b as usize), emit Decoded::Frame(self.current_frame_mut()))
             }
             DecodeSubBlock(left) => {
                 if left > 0 {
                     let n = cmp::min(left, buf.len());
                     let decoder = self.lzw_reader.as_mut().unwrap();
-                    let (consumed, bytes) = decoder.decode_bytes(&buf[..n])?;
+                    let (consumed, bytes) = decoder.decode_bytes(&buf[..n]);
                     goto!(consumed, DecodeSubBlock(left - consumed), emit Decoded::Data(bytes))
                 }  else if b != 0 { // decode next sub-block
                     goto!(DecodeSubBlock(b as usize))
@@ -521,7 +652,7 @@ impl StreamingDecoder {
                     // The end of the lzw stream is only reached if left == 0 and an additional call
                     // to `decode_bytes` results in an empty slice.
                     let decoder = self.lzw_reader.as_mut().unwrap();
-                    let (_, bytes) = decoder.decode_bytes(&[])?;
+                    let (_, bytes) = decoder.decode_bytes(&[]);
                     if bytes.len() > 0 {
                         goto!(0, DecodeSubBlock(0), emit Decoded::Data(bytes))
                     } else {
