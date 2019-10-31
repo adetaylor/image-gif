@@ -4,6 +4,7 @@ use std::cmp;
 use std::mem;
 use std::iter;
 use std::io::prelude::*;
+use std::collections::vec_deque::VecDeque;
 
 use traits::{Parameter, SetParameter};
 use common::Frame;
@@ -128,7 +129,7 @@ pub struct Reader<R: Read> {
     bg_color: Option<u8>,
     global_palette: Option<Vec<u8>>,
     current_frame: Frame<'static>,
-    buffer: Vec<u8>,
+    buffer: VecDeque<u8>,
     // Offset in current frame
     offset: usize
 
@@ -146,7 +147,7 @@ impl<R> Reader<R> where R: Read {
             },
             bg_color: None,
             global_palette: None,
-            buffer: Vec::with_capacity(32),
+            buffer: VecDeque::with_capacity(32),
             color_output: color_output,
             memory_limit: memory_limit,
             current_frame: Frame::default(),
@@ -263,17 +264,17 @@ impl<R> Reader<R> where R: Read {
     pub fn fill_buffer(&mut self, mut buf: &mut [u8]) -> Result<bool, DecodingError> {
         use self::ColorOutput::*;
         const PLTE_CHANNELS: usize = 3;
-        macro_rules! handle_data(
-            ($data:expr) => {
-                match self.color_output {
+        let buf_len = self.buffer.len();
+        if buf_len > 0 {
+            let (len, channels) = match self.color_output {
                     RGBA => {
                         let transparent = self.current_frame.transparent;
                         let palette: &[u8] = match self.current_frame.palette {
                             Some(ref table) => &*table,
                             None => &*self.global_palette.as_ref().unwrap(),
                         };
-                        let len = cmp::min(buf.len()/N_CHANNELS, $data.len());
-                        for (rgba, &idx) in buf[..len*N_CHANNELS].chunks_mut(N_CHANNELS).zip($data.iter()) {
+                        let len = cmp::min(buf.len()/N_CHANNELS, self.buffer.len());
+                        for (rgba, &idx) in buf[..len*N_CHANNELS].chunks_mut(N_CHANNELS).zip(self.buffer.iter()) {
                             let plte_offset = PLTE_CHANNELS * idx as usize;
                             if palette.len() >= plte_offset + PLTE_CHANNELS {
                                 let colors = &palette[plte_offset..];
@@ -290,18 +291,15 @@ impl<R> Reader<R> where R: Read {
                         (len, N_CHANNELS)
                     },
                     Indexed => {
-                        let len = cmp::min(buf.len(), $data.len());
-                        buf[..len].copy_from_slice(&$data[..len]);
+                        let len = cmp::min(buf.len(), self.buffer.len());
+                        let (a, b) = self.buffer.as_slices();
+                        buf[..a.len()].copy_from_slice(&a);
+                        buf[a.len()..len].copy_from_slice(&a);
                         (len, 1)
                     }
-                }
-            }
-        );
-        let buf_len = self.buffer.len();
-        if buf_len > 0 {
-            let (len, channels) = handle_data!(&self.buffer);
+                };
             self.buffer.drain(0..len);
-            let buf_ = buf; buf = &mut buf_[len*channels..];
+            buf = &mut buf[len*channels..];
             if buf.len() == 0 {
                 return Ok(true)
             }
@@ -310,8 +308,37 @@ impl<R> Reader<R> where R: Read {
             match self.decoder.decode_next()? {
                 Some(Decoded::Data(data)) => {
                     //println!("Got data len {:?}, {:?}", data.len(), &data);
-                    let (len, channels) = handle_data!(data);
-                    let buf_ = buf; buf = &mut buf_[len*channels..]; // shorten buf
+                    let (len, channels) = match self.color_output {
+                            RGBA => {
+                                let transparent = self.current_frame.transparent;
+                                let palette: &[u8] = match self.current_frame.palette {
+                                    Some(ref table) => &*table,
+                                    None => &*self.global_palette.as_ref().unwrap(),
+                                };
+                                let len = cmp::min(buf.len()/N_CHANNELS, data.len());
+                                for (rgba, &idx) in buf[..len*N_CHANNELS].chunks_mut(N_CHANNELS).zip(data.iter()) {
+                                    let plte_offset = PLTE_CHANNELS * idx as usize;
+                                    if palette.len() >= plte_offset + PLTE_CHANNELS {
+                                        let colors = &palette[plte_offset..];
+                                        rgba[0] = colors[0];
+                                        rgba[1] = colors[1];
+                                        rgba[2] = colors[2];
+                                        rgba[3] = if let Some(t) = transparent {
+                                            if t == idx { 0x00 } else { 0xFF }
+                                        } else {
+                                            0xFF
+                                        }
+                                    }
+                                }
+                                (len, N_CHANNELS)
+                            },
+                            Indexed => {
+                                let len = cmp::min(buf.len(), data.len());
+                                buf[..len].copy_from_slice(&data[..len]);
+                                (len, 1)
+                            }
+                        };
+                    buf = &mut buf[len*channels..]; // shorten buf
                     if buf.len() > 0 {
                         continue
                     } else if len < data.len() {

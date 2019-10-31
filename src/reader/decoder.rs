@@ -232,6 +232,8 @@ pub enum Decoded<'a> {
     /// The returned frame does **not** any image data.
     Frame(&'a Frame<'static>),
     /// Decoded some data of the current frame.
+    /// Contains a function which can populate a buffer with
+    /// that data.
     Data(&'a [u8]),
     /// No more data available the current frame.
     DataEnd,
